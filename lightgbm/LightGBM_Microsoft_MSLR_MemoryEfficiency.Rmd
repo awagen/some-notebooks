@@ -1,0 +1,334 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.15.2
+  kernelspec:
+    display_name: nb_env
+    language: python
+    name: nb_env
+---
+
+```{python}
+import sys
+import math
+from sklearn.datasets import load_svmlight_file
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import h5py
+from pathlib import Path
+from typing import Dict, List, Union
+import getpass
+import json
+```
+
+## General Info
+
+Check out the docs: `https://lightgbm.readthedocs.io/en/latest/Python-Intro.html`
+
+
+## General Utility Functions
+
+```{python}
+def convert_size(size_bytes):
+   if size_bytes == 0:
+       return "0B"
+   size_name = ("B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB")
+   i = int(math.floor(math.log(size_bytes, 1024)))
+   p = math.pow(1024, i)
+   s = round(size_bytes / p, 2)
+   return "%s %s" % (s, size_name[i])
+
+def formatted_size(obj):
+    return convert_size(sys.getsizeof(obj))
+```
+
+## Utilizing hdf5 to allow data pulling via batches even from multiple source files
+
+The below hdf5 / Dataset specific code is based on the official Microsoft repo code `https://github.com/microsoft/LightGBM/blob/master/examples/python-guide/dataset_from_multi_hdf5.py` with some adjustments and additional comments.
+
+```{python}
+class HDFSequence(lgb.Sequence):
+    """
+    Construct a sequence object from HDF5 with required interface.
+
+        Parameters
+        ----------
+        hdf_dataset : h5py.Dataset
+            Dataset in HDF5 file.
+        batch_size : int
+            Size of a batch. When reading data to construct lightgbm Dataset, each read reads batch_size rows.
+    
+    HDF Sequence which takes hdf datasets from a file, e.g via h5py.File(file_path, "r")[dataset_key], where dataset_key would be "X" if 
+    the dataset was stored as "X" on creation of the hdf5 file. 
+    This allows us to draw batches from multiple files, allowing to process data that is larger than memory, and batch-wise construct
+    the dataset needed for training.
+    Example:
+    f = h5py.File('train.hdf5', 'r')
+    train_data = lgb.Dataset(HDFSequence(f['X'], 8192), label=f['Y'][:])
+    """
+    
+    def __init__(self, hdf_dataset, batch_size):
+        self.data = hdf_dataset
+        self.batch_size = batch_size
+
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+    def __len__(self):
+        return len(self.data)
+```
+
+```{python}
+def save2hdf(input_data: Dict[str, any], file_path: str, chunk_size: int):
+    """Store numpy array to HDF5 file.
+
+    Please note chunk size settings in the implementation for I/O performance optimization.
+
+    
+    """
+    with h5py.File(file_path, "w") as f:
+        for name, data in input_data.items():
+            nrow, ncol = data.shape
+            if ncol == 1:
+                # Y has a single column and we read it in single shot. So store it as an 1-d array.
+                chunk = (nrow,)
+                data = data.values.flatten()
+            else:
+                # We use random access for data sampling when creating LightGBM Dataset from Sequence.
+                # When accessing any element in a HDF5 chunk, it's read entirely.
+                # To save I/O for sampling, we should keep number of total chunks much larger than sample count.
+                # Here we are just creating a chunk size that matches with batch_size.
+                #
+                # Also note that the data is stored in row major order to avoid extra copy when passing to
+                # lightgbm Dataset.
+                chunk = (chunk_size, ncol)
+            f.create_dataset(name, data=data, chunks=chunk, compression="lzf")
+
+
+def store_df_as_hdf5(x_df: pd.DataFrame, 
+                     y_df: pd.DataFrame, 
+                     groups: Union[List[str], pd.Series, np.ndarray],
+                     feature_names: Union[None, List[str], pd.Series, np.ndarray],
+                     categorical_features: Union[None, List[str], pd.Series, np.ndarray],
+                     file_path: str,
+                     chunk_size: int):
+    """
+    Store features, targets and corresponding groups in a hdf5 file to pull them out during dataset creation.
+    
+    NOTE: hdf5 files also allow to store attributes for each dataset. 
+    - Setting an attribute value: f[dataset_key].attrs[attr_name] = attr_value 
+    - After loading of hdf5 file, can check which attributes are set: list(f[dataset_key].attrs.keys()) 
+    - Select attribute: f[dataset_key].attrs[attr_name]
+
+    Note that in the save2hdf function used chunks are defined, which are important to optimize IO (on accessing an element,
+    the whole chunk it belongs to is read, thus its advised to have the number of chunks much larger than the
+    bin_construct_sample_cnt parameter set on dataset creation (default is 200000)
+    """
+    store_dict = {
+        "X": x_df,
+        "Y": y_df,
+        "groups": pd.DataFrame(groups)
+    }
+    if feature_names is not None:
+        store_dict["feature_names"] = pd.DataFrame(feature_names)
+    if categorical_features is not None:
+        store_dict["categorical_features"] = pd.DataFrame(categorical_features)
+    save2hdf(input_data=store_dict, file_path=file_path, chunk_size=chunk_size)
+
+
+def read_hdf5_data(path_to_hdf5_file: str):
+    """
+    Read a hdf5 file. After creating the hdf5 file object, can do:
+    - get available dataset keys with list(f.keys()) and respective dataset with f[dataset_key]  
+    - get attributes for dataset with list(f[dataset_key].attrs.keys()) and specific attr value with f[dataset_key].attrs[attr_key].
+    - access the data by the basic range, index operations and such (e.g f[dataset_key][:])
+    """
+    return h5py.File(path_to_hdf5_file, 'r')
+```
+
+```{python}
+def create_dataset_from_multiple_hdf(input_flist: List[str], 
+                                     batch_size: int, 
+                                     output_file: str,
+                                     bin_construct_sample_cnt: int = 200000,
+                                     max_bin: int = 255, 
+                                     reference_dataset: lgb.Dataset = None):
+    """
+    Assumes in each hdf5 file the features are stored in dataset with following datasets:
+    - features under key `X`
+    - targets under key `Y` 
+    - groups under key `groups`
+    - feature_names under key `feature_names`
+    - categorical_features under key `categorical_features`
+    With binary dataset created, we can use either Python API or cmdline version to train, saving the dataset preparation step and memory
+    since by using HDFSequence here the dataset is created iteratively by pulling batches of data rather than full data in memory.
+
+    Dataset will use column names like ["0", "1", "2", ...]
+    """
+    data = []
+    ylist = []
+    grouplist = []
+    features = None
+    categorical_features = None
+    for f in input_flist:
+        f = h5py.File(f, "r")
+        # features and categorical features are not specific to a each dataset, thus we assume it is the same order in 
+        # all and just pull it once
+        if features is None and "feature_names" in list(f.keys()):
+            features = f["feature_names"]
+        if categorical_features is None and "categorical_features" in list(f.keys()):
+            categorical_features = f["categorical_features"]
+        data.append(HDFSequence(f["X"], batch_size))
+        ylist.append(f["Y"][:])
+        grouplist.append(f["groups"][:])
+
+    # these are also the defaults right now
+    # note that if increasing max_bin, this will also have effect on the storage type and thus size of the features,
+    # e.g for valueof 255, uint8_t will be used, for 256 it would already need higher accuracy type
+    params = {
+        "bin_construct_sample_cnt": bin_construct_sample_cnt,
+        "max_bin": max_bin
+    }
+    y = np.concatenate(ylist)
+    groups = np.concatenate(grouplist)
+    if categorical_features is None:
+        categorical_features = "auto"
+    if features is None:
+        features = "auto"
+    dataset = lgb.Dataset(data, 
+                          label=y, 
+                          params=params, 
+                          group=groups, 
+                          feature_name=features, 
+                          categorical_feature=categorical_features,
+                          reference=reference_dataset)
+    dataset.save_binary(output_file)
+    return dataset
+```
+
+## Getting an example data set (e.g Microsoft MLSR WEB10K / WEB30K)
+
+Both the 10K and 30K Datasets to be found here: `https://www.microsoft.com/en-us/research/project/mslr/`
+
+
+Data paths, replace with your own:
+
+```{python}
+data_path = f"/media/{getpass.getuser()}/Data/LTR_DATASETS/MSLR-WEB10K/Fold1"
+train_path = f"{data_path}/train.txt"
+test_path = f"{data_path}/test.txt"
+validation_path = f"{data_path}/vali.txt"
+```
+
+```{python}
+data_dict = {
+    "train": train_path,
+    "test": test_path,
+    "validation": validation_path
+}
+```
+
+```{python}
+def load_data_and_store_as_hdf5(input_path: str, output_path: str):
+    print(f"Loading data: {input_path}")
+    X, y, qid = load_svmlight_file(input_path, query_id=True)
+    print(f"Shape features, target: {X.shape}, {y.shape}")
+    df_x = pd.DataFrame(X.todense())
+    df_y = pd.DataFrame(y)
+    _, groups = np.unique(qid, return_counts=True)
+    # store hdf5 file
+    print(f"Storing data: {output_path}")
+    store_df_as_hdf5(x_df=df_x, 
+                 y_df=df_y, 
+                 groups=groups,
+                 feature_names=None ,
+                 categorical_features=None,
+                 file_path=output_path,
+                 chunk_size=100)    
+    print(f"Done storing data: {output_path}")
+```
+
+### Store data within hdf5 file as datasets
+
+```{python}
+for name, path in data_dict.items():
+    load_data_and_store_as_hdf5(input_path=path, output_path=f"./{name}_data.hdf5")
+```
+
+### Use hdf5 files to generate datasets iteratively by loading batches from hdf5 files
+
+This step allows creating datasets from data that would not fit into memory all at once. The created datasets occupy only around 10 % of the
+storage size of the original data.
+
+```{python}
+# NOTE: for datasets to be used as validation data, the original train data has to be set as reference, otherwise
+# we might see errors if running lgb.train with valid_sets
+train_dataset = create_dataset_from_multiple_hdf(input_flist = ["./train_data.hdf5"], batch_size = 8192, output_file = "./train_data.bin")
+create_dataset_from_multiple_hdf(input_flist = ["./test_data.hdf5"], batch_size = 8192, output_file = "./test_data.bin")
+create_dataset_from_multiple_hdf(input_flist = ["./validation_data.hdf5"], batch_size = 8192, output_file = "./validation_data.bin", reference_dataset=train_dataset)
+```
+
+## Fitting LightGBM Ranker
+
+```{python}
+lgb_train_dataset = lgb.Dataset(data="./train_data.bin")
+lgb_test_dataset = lgb.Dataset(data="./test_data.bin")
+lgb_validation_dataset = lgb.Dataset(data="./validation_data.bin", reference=lgb_train_dataset)
+lgb_train_dataset.construct()
+lgb_test_dataset.construct()
+lgb_validation_dataset.construct()
+```
+
+```{python}
+print(formatted_size(lgb_train_dataset))
+```
+
+```{python}
+params = {
+    "objective": "lambdarank",
+    "boosting_type": "gbdt",
+    "lambdarank_norm": True,
+    "lambdarank_truncation_level": 33,
+    "learning_rate": 0.1,
+    "max_depth": -1,
+    "n_estimators": 100,
+    "num_leaves": 31,
+    "metric": ["ndcg", "auc"],
+    "ndcg_eval_at": [5, 10, 30],
+    "metric_freq": 1,
+    "device_type": "cpu"
+}
+eval_metrics = {}
+model = lgb.train(
+    params=params,
+    train_set=lgb_train_dataset,
+    valid_sets=[lgb_validation_dataset],
+    valid_names=["validation_set"],
+    # callbacks=[lgb.log_evaluation(), lgb.record_evaluation(eval_metrics)]
+    callbacks=[
+        lgb.record_evaluation(eval_metrics),
+        lgb.early_stopping(stopping_rounds=10)
+    ]
+)
+model.save_model('model.txt')
+json_model = json.dumps(model.dump_model())
+with open("model.json", "w") as f:
+    f.write(json.dumps(json_model))
+```
+
+```{python}
+eval_metrics
+```
+
+```{python}
+json_model
+```
+
+```{python}
+
+```
